@@ -1,0 +1,513 @@
+import * as model from '../../../model';
+import * as Controller from '../../../controller';
+import * as Context from '../../../app_context';
+import React from 'react';
+import { connect } from 'react-redux';
+import { createRef } from 'react';
+import _ from 'lodash';
+import { TriangleAlert } from 'lucide-react';
+import QueryPlanViewer from './query_plan_viewer';
+import { chartInk } from '../../../style/theme';
+import dagre from 'dagre';
+import { ConnectionLineType, Position } from 'react-flow-renderer';
+import CSS from 'csstype';
+import { QueryplanNodeData } from './query_plan_node';
+import { QueryplanNodeTooltipData } from './query_plan_node_tooltip_content';
+
+const hasOwn = (target: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(target, key);
+
+export interface AppstateProps {
+    appContext: Context.IAppContext;
+    currentOperator: Array<string> | "All";
+    currentOperatorActiveTimeframePipeline: Array<string> | "All";
+    operators: model.IOperatorsData | undefined;
+    chartData: model.IQueryPlanData,
+}
+
+type Props = model.IQueryPlanProps & AppstateProps;
+
+interface State {
+    loading: boolean,
+    renderedFlowPlan: JSX.Element | undefined,
+    renderFlowPlan: boolean,
+}
+
+export type PlanNode = {
+    label: string
+    operatorId: string,
+    analyzePlanId: number,
+    estimatedCardinality?: number,
+    parent: string,
+    borderFill: string,
+    backgroundFill: string,
+    nodeCursor: string,
+    textColor: string,
+    isNodeSelectable: boolean,
+    tooltipData: QueryplanNodeTooltipData,
+    cssClass: string,
+}
+
+export type PlanEdge = {
+    source: string,
+    target: string,
+    analyzedCardinality?: number,
+    isReference?: boolean,
+}
+
+export type FlowGraphNode = {
+    id: string;
+    position: {
+        x: number;
+        y: number;
+    };
+    data: QueryplanNodeData;
+    targetPosition: Position;
+    sourcePosition: Position;
+    selectable: boolean;
+    type: string,
+    style: CSS.Properties,
+    className: string,
+}
+
+export type FlowGraphEdge = {
+    id: string,
+    source: string,
+    target: string,
+    type: ConnectionLineType,
+    animated: boolean,
+    style: CSS.Properties,
+    label: string | undefined,
+    labelStyle: CSS.Properties,
+}
+
+export type FlowGraphElements = Array<FlowGraphNode | FlowGraphEdge>;
+
+
+class QueryPlanWrapper extends React.Component<Props, State> {
+
+    graphContainer = createRef<HTMLDivElement>();
+
+    constructor(props: Props) {
+        super(props);
+        this.state = {
+            loading: true,
+            renderedFlowPlan: undefined,
+            renderFlowPlan: true,
+        };
+    }
+
+    componentDidMount() {
+        this.createQueryPlan();
+    }
+
+    componentDidUpdate(prevProps: Props) {
+        if (!_.isEqual(this.props.currentOperatorActiveTimeframePipeline, prevProps.currentOperatorActiveTimeframePipeline)) {
+            this.updateQueryPlan();
+        }
+    }
+
+    public render() {
+
+        return <div
+            id="queryplanContainer"
+            className="box-border flex w-full flex-auto flex-col items-center justify-center"
+        >
+            <div className="relative z-10 w-full">
+                {Controller.createChartResetComponent('pipelinesOperators')}
+            </div>
+            <div className="relative top-px mb-0 font-['Segoe_UI'] text-[11px] font-bold text-foreground">Query Plan</div>
+            {this.state.renderedFlowPlan}
+
+        </div>
+    }
+
+    updateQueryPlan() {
+        this.setState((state, props) => ({
+            ...state,
+            loading: true,
+            renderedFlowPlan: undefined,
+        }));
+        this.createQueryPlan();
+    }
+
+    createQueryPlan() {
+        const queryPlanJson = this.props.chartData.queryplanData;
+        let queryplanContent: JSX.Element;
+
+        if (undefined === queryPlanJson || hasOwn(queryPlanJson, 'error')) {
+            queryplanContent = this.createNoQueryPlanWarning();
+        } else {
+            queryplanContent = this.createPlanViewer(queryPlanJson);
+        }
+        this.setState((state, props) => ({
+            ...state,
+            loading: false,
+            renderedFlowPlan: queryplanContent,
+        }));
+    }
+
+    createPlanViewer(queryplanJson: object) {
+
+        const rootNode = {
+            operatorId: "root",
+            child: queryplanJson,
+            analyzePlanId: -1, //-1 as first operator begins with 0 in queryplan data
+        }
+        const flowGraphData = this.createFlowGraphData(rootNode);
+
+        const planViewer = React.createElement(QueryPlanViewer, {
+            key: this.props.height + this.props.width,
+            height: this.props.height,
+            width: this.props.width,
+            graphElements: flowGraphData,
+        } as any);
+
+        return planViewer;
+    }
+
+    createFlowGraphData(root: Partial<PlanNode> & { child: object }): FlowGraphElements {
+
+        const planData = {
+            nodes: new Array<PlanNode>(),
+            links: new Array<PlanEdge>()
+        }
+        const referenceNodes = new Array<{
+            referenceTargetAnalyzePlanId: number,
+            referenceNode: any,
+            isScannedOperator?: boolean,
+        }>();
+
+
+
+        const nodeCursor = (nodeOperatorId: string) => {
+            //return tuple with 0: cursor style, 1: node selectable flag
+            if (nodeOperatorId === "root") {
+                return ["default", false];
+            } else if (Controller.isOperatorUnavailable(nodeOperatorId)) {
+                //node does not appear in measurement data or in uri data, hence enable/disable makes no sense
+                return ["not-allowed", false];
+            } else {
+                return ["pointer", true];
+            }
+        }
+
+        const nodeColor = (nodeOperatorId: string) => {
+            //return tuple with 0: border color, 1: background color
+            if (nodeOperatorId === "root") {
+                //root node
+                return [this.props.appContext.secondaryColor, chartInk().surface];
+            } else if (Controller.isOperatorUnavailable(nodeOperatorId)) {
+                //node does not appear in measurement data or in uri data, hence enable/disable makes no sense
+                return [chartInk().surface, this.props.appContext.tertiaryColor + model.chartConfiguration.colorLowOpacityHex];
+            } else if (Controller.isOperatorSelected(nodeOperatorId)) {
+                //active node
+                const operatorIndex = this.props.operators!.operatorsId.indexOf(nodeOperatorId);
+                return [chartInk().surface, model.chartConfiguration.colorScale!.operatorsIdColorScale[operatorIndex]];
+            } else {
+                //inactive node
+                const operatorIndex = this.props.operators!.operatorsId.indexOf(nodeOperatorId);
+                return [chartInk().surface, model.chartConfiguration.colorScale!.operatorsIdColorScaleLowOpacity[operatorIndex],];
+            }
+        }
+
+        const nodeTextColor = (nodeOperatorId: string) => {
+            if (Controller.isOperatorUnavailable(nodeOperatorId)) {
+                return '#919191';
+            } else {
+                return this.props.appContext.accentBlack;
+            }
+        }
+
+        // Scan table names straight from the plan payload. The nice-name
+        // channel (operatorsNice) is derived from SAMPLE rows' op_ext, so a
+        // scan that never got sampled — nation's 25 rows under a 1ms sampler —
+        // has no entry there and used to render as a bare "tablescan2", even
+        // though the plan node carries tablename all along.
+        const scanTableByOp = new Map<string, string>();
+        {
+            const collect = (node: any) => {
+                if (!node || typeof node !== 'object') return;
+                if (typeof node.operator === 'string' && typeof node.tablename === 'string'
+                    && node.tablename.length > 0) {
+                    scanTableByOp.set(node.operator, node.tablename);
+                }
+                for (const k of ["input", "left", "right", "magic", "pipelineBreaker"]) {
+                    if (node[k] && typeof node[k] === 'object') collect(node[k]);
+                }
+                for (const a of node.arguments ?? []) collect(a);
+            };
+            collect(root.child);
+        }
+
+        const nodeLabel = (nodeOperatorId: string) => {
+            if (nodeOperatorId === "root") {
+                return "RESULT";
+            } else if (this.props.operators!.operatorsId.includes(nodeOperatorId)) {
+                return this.props.operators!.operatorsNice[this.props.operators!.operatorsId.indexOf(nodeOperatorId)];
+            } else if (scanTableByOp.has(nodeOperatorId)) {
+                // Same shape the sample-derived channel produces ("☷ region scan"),
+                // so sampled and unsampled scans read alike.
+                return `\u{2637} ${scanTableByOp.get(nodeOperatorId)} scan`;
+            } else {
+                return nodeOperatorId;
+            }
+        }
+
+        const nodeClass = (nodeOperatorId: string) => {
+            if (nodeOperatorId === "root") {
+                return "";
+            } else if (Controller.isOperatorUnavailable(nodeOperatorId)) {
+                return "";
+            } else {
+                return "hover:opacity-50!";
+            }
+        }
+
+        const nodeTooltipData = (nodeId: string, estimatedCardinality?: number): QueryplanNodeTooltipData => {
+            const tooltipUirLines: string[] = [];
+            const tooltipUirLineNumbers: number[] = [];
+            const tooltipUirOccurrences: number[] = [];
+            let tooltipUirTotalOccurrences: number = 0;
+            this.props.chartData.nodeTooltipData.operators.forEach((operator: string, index: number) => {
+                if (operator === nodeId) {
+                    tooltipUirLines.push(this.props.chartData.nodeTooltipData.uirLines[index]);
+                    tooltipUirLineNumbers.push(this.props.chartData.nodeTooltipData.uirLineNumbers[index]);
+                    tooltipUirOccurrences.push(this.props.chartData.nodeTooltipData.eventOccurrences[index]);
+                    if (tooltipUirTotalOccurrences === 0) tooltipUirTotalOccurrences = this.props.chartData.nodeTooltipData.operatorTotalFrequency[index];
+                }
+            });
+            return {
+                uirLines: tooltipUirLines,
+                uirLineNumber: tooltipUirLineNumbers,
+                eventOccurrences: tooltipUirOccurrences,
+                totalEventOccurrence: tooltipUirTotalOccurrences,
+                estimatedCardinality,
+            }
+        }
+
+        const rootCursor = nodeCursor(root.operatorId!);
+        const rootColor = nodeColor(root.operatorId!);
+        const rootTextColor = nodeTextColor(root.operatorId!);
+        const rootTooltipData = nodeTooltipData(root.operatorId!);
+        const rootNodeLabel = nodeLabel(root.operatorId!);
+        const nodeCssClass = nodeClass(root.operatorId!);
+        planData.nodes.push({
+            label: rootNodeLabel,
+            operatorId: root.operatorId!,
+            analyzePlanId: root.analyzePlanId!,
+            parent: "",
+            nodeCursor: rootCursor[0] as string,
+            isNodeSelectable: rootCursor[1] as boolean,
+            borderFill: rootColor[0],
+            backgroundFill: rootColor[1],
+            textColor: rootTextColor,
+            tooltipData: rootTooltipData,
+            cssClass: nodeCssClass,
+        })
+
+        fillGraph(root.child, root.operatorId!);
+
+        function fillGraph(currentPlanElement: any, parent: string) {
+
+            const currentOperatorId = currentPlanElement.operator;
+            const currentEstimatedCardinality = currentPlanElement.cardinality;
+
+            const planNodeCursor = nodeCursor(currentOperatorId);
+            const planNodeColor = nodeColor(currentOperatorId);
+            const planNodeTextColor = nodeTextColor(currentOperatorId);
+            const planNodeTooltipData = nodeTooltipData(currentOperatorId, currentEstimatedCardinality);
+            const planNodeLabel = nodeLabel(currentOperatorId);
+            const planNodeCssClass = nodeClass(currentOperatorId);
+
+            planData.nodes.push({
+                label: planNodeLabel,
+                operatorId: currentOperatorId,
+                analyzePlanId: currentPlanElement.analyzePlanId,
+                estimatedCardinality: currentEstimatedCardinality,
+                parent: parent,
+                nodeCursor: planNodeCursor[0] as string,
+                isNodeSelectable: planNodeCursor[1] as boolean,
+                borderFill: planNodeColor[0],
+                backgroundFill: planNodeColor[1],
+                textColor: planNodeTextColor,
+                tooltipData: planNodeTooltipData,
+                cssClass: planNodeCssClass,
+            });
+            planData.links.push({
+                source: parent,
+                target: currentPlanElement.operator,
+                analyzedCardinality: currentPlanElement.analyzePlanCardinality,
+            });
+            if (hasOwn(currentPlanElement, 'groupBy')) {
+                referenceNodes.push({ referenceTargetAnalyzePlanId: currentPlanElement['groupBy'], referenceNode: currentPlanElement });
+            }
+            if (hasOwn(currentPlanElement, 'source')) {
+                referenceNodes.push({ referenceTargetAnalyzePlanId: currentPlanElement['source'], referenceNode: currentPlanElement });
+            }
+            if (hasOwn(currentPlanElement, 'scannedOperator') && !hasOwn(currentPlanElement, 'pipelineBreaker')) {
+                referenceNodes.push({ referenceTargetAnalyzePlanId: currentPlanElement['scannedOperator'], referenceNode: currentPlanElement, isScannedOperator: true });
+            }
+
+            ["input", "left", "right", "magic", "pipelineBreaker"].forEach(childType => {
+                    if (hasOwn(currentPlanElement, childType) && currentPlanElement[childType] !== 0) {
+                        fillGraph(currentPlanElement[childType], currentPlanElement.operator);
+                    }
+            });
+
+            if (hasOwn(currentPlanElement, "arguments") && currentPlanElement["arguments"] !== 0) {
+                currentPlanElement["arguments"].forEach((arg:any) => {
+                    // console.log(arg.operator);
+                    ["input", "left", "right", "magic", "pipelineBreaker"].forEach(childType => {
+                        if (hasOwn(arg, childType) && arg[childType] !== 0) {
+                            fillGraph(arg[childType], currentPlanElement.operator);
+                        }
+                    });
+                })
+            }
+        }
+
+        //Add links for references
+        if (referenceNodes.length > 0) {
+            referenceNodes.forEach((reference) => {
+                const referenceOperator = planData.nodes.find(planNodes => {
+                    return planNodes.analyzePlanId === reference.referenceTargetAnalyzePlanId;
+                });
+                const referenceOperatorId = referenceOperator!.operatorId;
+                if (reference.isScannedOperator) {
+                    planData.links.push({
+                        source: reference.referenceNode.operator,
+                        target: referenceOperatorId,
+                        isReference: true,
+                    });
+                } else {
+                    planData.links.push({
+                        source: referenceOperatorId,
+                        target: reference.referenceNode.operator,
+                        isReference: true,
+                    });
+                }
+            });
+        }
+
+        const flowGraphElements: FlowGraphElements = this.createReactFlowNodesEdges(planData.nodes, planData.links);
+
+        return flowGraphElements;
+    }
+
+    createReactFlowNodesEdges(nodes: PlanNode[], edges: PlanEdge[]): FlowGraphElements {
+        const nodeWidth = 150;
+        const nodeHight = 35;
+        const dagreGraph = this.getDagreLayoutedElements(nodes, edges, nodeWidth, nodeHight);
+
+        const isVertical = this.getGraphDirection() === 'TB';
+
+        const reactFlowNodes: FlowGraphNode[] = nodes.map((planNode) => {
+            const nodeWithPosition = dagreGraph.node(planNode.operatorId);
+            const position = {
+                x: nodeWithPosition.x - nodeWidth / 2 + Math.random() / 1000,
+                y: nodeWithPosition.y - nodeHight / 2,
+            }
+            const style: CSS.Properties = {
+                border: 'solid',
+                width: '130px',
+                height: '30px',
+                borderWidth: '4px',
+                borderRadius: '25px',
+                backgroundColor: planNode.backgroundFill,
+                borderColor: planNode.borderFill,
+                cursor: planNode.nodeCursor,
+                fontSize: '15px',
+                color: planNode.textColor,
+            }
+
+            const data: QueryplanNodeData = {
+                label: planNode.label,
+                tooltipData: planNode.tooltipData,
+            }
+
+            const reactFlowNode: FlowGraphNode = {
+                id: planNode.operatorId,
+                data,
+                position,
+                style,
+                targetPosition: isVertical ? Position.Bottom : Position.Left,
+                sourcePosition: isVertical ? Position.Top : Position.Right,
+                selectable: planNode.isNodeSelectable,
+                type: 'queryplanNode',
+                className: planNode.cssClass,
+            }
+            return reactFlowNode;
+
+        });
+
+        const reactFlowEdges: FlowGraphEdge[] = edges.map((planEdge) => {
+            const reactFlowEdge: FlowGraphEdge = {
+                //turn around source and target to invert direction of edge animation
+                id: planEdge.source + "_" + planEdge.target,
+                source: planEdge.target,
+                target: planEdge.source,
+                type: ConnectionLineType.Bezier,
+                style: {
+                    stroke: this.props.appContext.tertiaryColor,
+                    strokeWidth: '1px'
+                },
+                animated: planEdge.isReference ? true : false,
+                label: planEdge.analyzedCardinality ? `${model.chartConfiguration.nFormatter(+planEdge.analyzedCardinality, 1)}` : "",
+                labelStyle: {
+                    fill: this.props.appContext.tertiaryColor,
+                }
+            }
+            return reactFlowEdge;
+        });
+
+        return [...reactFlowNodes, ...reactFlowEdges];
+    }
+
+    getDagreLayoutedElements(nodes: PlanNode[], edges: PlanEdge[], nodeWidth: number, nodeHight: number) {
+
+        const dagreGraph = new dagre.graphlib.Graph();
+        dagreGraph.setGraph({ rankdir: this.getGraphDirection() });
+        dagreGraph.setDefaultEdgeLabel(function () { return {}; });
+
+        nodes.forEach((node) => {
+            dagreGraph.setNode(node.operatorId, { label: node.label, width: nodeWidth, height: nodeHight });
+        });
+        edges.forEach((edge => {
+            dagreGraph.setEdge(edge.source, edge.target);
+        }));
+
+        dagre.layout(dagreGraph);
+
+        return dagreGraph;
+    }
+
+    getGraphDirection() {
+        return this.props.height > this.props.width ? 'TB' : 'RL';
+    }
+
+    createNoQueryPlanWarning() {
+        return <div className="flex flex-col items-center justify-center">
+            <TriangleAlert
+                size={35}
+                color={this.props.appContext.secondaryColor}
+            />
+            <span
+                className="text-xs"
+                style={{ color: this.props.appContext.tertiaryColor }}
+            >
+                A Problem occured reading the query plan.
+            </span>
+        </div>
+    }
+}
+
+
+const mapStateToProps = (state: model.AppState, ownProps: model.IQueryPlanProps) => ({
+    currentOperator: state.currentOperator,
+    operators: state.operators,
+    chartData: state.chartData[ownProps.chartId].chartData.data as model.IQueryPlanData,
+    currentOperatorActiveTimeframePipeline: state.currentOperatorActiveTimeframePipeline,
+});
+
+
+export default connect(mapStateToProps, undefined)(Context.withAppContext(QueryPlanWrapper));

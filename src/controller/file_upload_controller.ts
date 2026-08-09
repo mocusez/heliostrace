@@ -1,0 +1,37 @@
+import * as model from '../model';
+import { store, appContext } from '../app_config';
+
+export function handleNewFile(file: File){
+    setFileLoading(true);
+    setHeliosFileParsingFinished(false);
+    setFile(file);
+    appContext.controller.registerFileAtWorker(file);
+}
+
+export function resetState() {
+    store.dispatch({
+        type: model.StateMutationType.SET_RESET_STATE,
+        data: undefined,
+    });
+}
+
+function setFile(newFile: File) {
+    store.dispatch({
+        type: model.StateMutationType.SET_FILE,
+        data: newFile,
+    });
+}
+
+function setHeliosFileParsingFinished(newHeliosFileParsingFinished: boolean) {
+    store.dispatch({
+        type: model.StateMutationType.SET_HELIOS_FILE_PARSING_FINISHED,
+        data: newHeliosFileParsingFinished,
+    });
+}
+
+function setFileLoading(newFileLoading: boolean) {
+    store.dispatch({
+        type: model.StateMutationType.SET_FILE_LOADING,
+        data: newFileLoading,
+    });
+}

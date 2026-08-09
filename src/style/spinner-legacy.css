@@ -1,0 +1,26 @@
+/* Keyframes for the spinners that Tailwind utilities cannot express.
+   Referenced via arbitrary animate-[...] utilities in
+   src/components/utils/spinner/spinner.tsx and mini_spinner.tsx. */
+
+/* Piano loader: multi-step scaleX + background-color + box-shadow animation.
+   Colors: brand-secondary (#d4733e) and brand-tertiary (#919191). */
+@keyframes stretchdelay {
+    0%, 40%, 100% {
+        transform: scaleX(0.8);
+        background-color: #919191;
+        box-shadow: 0 0 0 rgba(10, 10, 10, 0.07);
+    }
+    20% {
+        transform: scaleX(1);
+        background-color: #d4733e;
+        box-shadow: 0 5px 6px #919191;
+    }
+}
+
+/* Plain 360deg rotation for the mini spinner (needs a globally available
+   keyframe name so animate-[minispin_.6s_linear_infinite] can reference it). */
+@keyframes minispin {
+    to {
+        transform: rotate(360deg);
+    }
+}

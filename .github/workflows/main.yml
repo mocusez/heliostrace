@@ -1,0 +1,39 @@
+name: HeliosTrace Public Version CI
+
+on:
+  push:
+    branches: [ public-version ]
+  pull_request:
+    branches: [ public-version ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: corepack enable
+
+      - run: pnpm install --frozen-lockfile
+      - run: cargo install wasm-pack --locked
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build:release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: build/release/**

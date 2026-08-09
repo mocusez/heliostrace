@@ -1,0 +1,14 @@
+[workspace]
+
+members = [
+    "crate",
+]
+
+# profiles must live at the workspace root (member-level profiles are ignored);
+# moved here from crate/Cargo.toml
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = true
+opt-level = "s"
